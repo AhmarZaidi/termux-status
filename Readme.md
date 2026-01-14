@@ -68,6 +68,9 @@ monitor
 
 ## Screenshots
 
+<img width="940" height="587" alt="Screenshot 2026-01-14 at 4 26 45 PM" src="https://github.com/user-attachments/assets/62af69f5-a6e7-4bd5-b0d3-4c7d2c681de4" />
+
+
 The dashboard features:
 - Color-coded progress bars (green/yellow/red based on usage)
 - Real-time data updates (configurable refresh rate)
