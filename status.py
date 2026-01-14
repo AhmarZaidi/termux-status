@@ -132,13 +132,14 @@ class TermuxMonitor:
         self.running = True
         self.selected_tab = 0
         self.tabs = [
-            ("📊", "Overview"),
+            ("😀", "Overview"),
             ("💻", "CPU"),
             ("🧠", "Memory"),
             ("💾", "Storage"),
             ("🔋", "Battery"),
             ("🌐", "Network"),
-            ("⚙️", "Processes")
+            ("📊", "Processes"),
+            ("⚙️", "Settings")
         ]
         self.refresh_rate = 0.5
         
@@ -148,6 +149,15 @@ class TermuxMonitor:
         
         # File explorer
         self.file_explorer = FileExplorer()
+
+        self.settings = {
+            "refresh_rate": 0.5,
+            "show_icons": True,
+            "color_theme": "default",  # default, minimal, dark
+            "battery_capacity_mah": 4000,
+            "file_explorer_start": "/data/data/com.termux/files/home"
+        }
+        self.settings_selected = 0  # Which setting is selected
         
         # Cached data
         self.system_data = {
@@ -269,7 +279,7 @@ class TermuxMonitor:
             time_remaining = "N/A"
             if current != 0:
                 # Assume typical battery capacity (you may need to adjust this)
-                battery_capacity_mah = 4000  # Adjust based on your device
+                battery_capacity_mah = self.settings.get("battery_capacity_mah", 4000)
                 
                 if "CHARGING" in status.upper() and current > 0:
                     remaining_capacity = battery_capacity_mah * (100 - percentage) / 100
@@ -927,6 +937,45 @@ class TermuxMonitor:
             border_style="cyan"
         )
     
+    def _make_settings_panel(self) -> Panel:
+        """Create settings panel"""
+        table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
+        table.add_column("", width=3, style="white")
+        table.add_column("Setting", style="cyan", width=30)
+        table.add_column("Value", style="white", width=20)
+        table.add_column("Description", style="dim")
+        
+        settings_list = [
+            ("refresh_rate", "Refresh Rate", f"{self.settings['refresh_rate']}s", "UI update frequency"),
+            ("show_icons", "Show Icons", "Yes" if self.settings['show_icons'] else "No", "Display emojis in tabs"),
+            ("color_theme", "Color Theme", self.settings['color_theme'].title(), "UI color scheme"),
+            ("battery_capacity_mah", "Battery Capacity", f"{self.settings['battery_capacity_mah']} mAh", "For time estimation"),
+            ("file_explorer_start", "Explorer Start Path", self.settings['file_explorer_start'][-25:], "Default browse location"),
+        ]
+        
+        for i, (key, name, value, desc) in enumerate(settings_list):
+            marker = "▶" if i == self.settings_selected else " "
+            style = "bold white" if i == self.settings_selected else "white"
+            table.add_row(marker, name, value, desc, style=style)
+        
+        help_text = Text()
+        help_text.append("\n", style="dim")
+        help_text.append("↑↓: Navigate  ", style="dim cyan")
+        help_text.append("←→: Adjust  ", style="dim cyan")
+        help_text.append("Enter: Edit  ", style="dim cyan")
+        help_text.append("r: Reset to defaults", style="dim yellow")
+        
+        content = Table.grid()
+        content.add_row(table)
+        content.add_row(help_text)
+        
+        return Panel(
+            content,
+            title="[bold cyan]⚙️  Settings[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
+    
     def _get_content_panel(self) -> Panel:
         """Get content based on selected tab"""
         _, tab_name = self.tabs[self.selected_tab]
@@ -937,14 +986,16 @@ class TermuxMonitor:
             return self._make_cpu_panel()
         elif tab_name == "Memory":
             return self._make_memory_panel()
-        elif tab_name == "Storage":
-            return self._make_storage_panel()
         elif tab_name == "Battery":
             return self._make_battery_panel()
         elif tab_name == "Network":
             return self._make_network_panel()
         elif tab_name == "Processes":
             return self._make_processes_panel()
+        elif tab_name == "Storage":
+            return self._make_storage_panel()
+        elif tab_name == "Settings":  # ADD THIS
+            return self._make_settings_panel()
         
         return Panel("Content not available", box=box.ROUNDED)
     
@@ -985,7 +1036,7 @@ class TermuxMonitor:
                     # Try to read more characters (for arrow keys)
                     old_flags = fcntl.fcntl(sys.stdin, fcntl.F_GETFL)
                     fcntl.fcntl(sys.stdin, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
-                    
+
                     try:
                         additional = sys.stdin.read(2)
                         char += additional
@@ -1009,6 +1060,51 @@ class TermuxMonitor:
                             self.selected_tab = (self.selected_tab - 1) % len(self.tabs)
                         elif char == '\x1b[B':  # Down
                             self.selected_tab = (self.selected_tab + 1) % len(self.tabs)
+                
+                # Settings navigation
+                if self.tabs[self.selected_tab][1] == "Settings" and not self.file_explorer.focused:
+                    if char == '\x1b[A':  # Up in settings
+                        self.settings_selected = max(0, self.settings_selected - 1)
+                        return
+                    elif char == '\x1b[B':  # Down in settings
+                        self.settings_selected = min(4, self.settings_selected + 1)  # 4 = number of settings - 1
+                        return
+                    elif char == '\x1b[C':  # Right arrow - increase value
+                        if self.settings_selected == 0:  # Refresh rate
+                            self.settings['refresh_rate'] = min(2.0, self.settings['refresh_rate'] + 0.1)
+                            self.refresh_rate = self.settings['refresh_rate']
+                        elif self.settings_selected == 1:  # Show icons
+                            self.settings['show_icons'] = not self.settings['show_icons']
+                        elif self.settings_selected == 2:  # Color theme
+                            themes = ["default", "minimal", "dark"]
+                            idx = themes.index(self.settings['color_theme'])
+                            self.settings['color_theme'] = themes[(idx + 1) % len(themes)]
+                        elif self.settings_selected == 3:  # Battery capacity
+                            self.settings['battery_capacity_mah'] = min(10000, self.settings['battery_capacity_mah'] + 500)
+                        return
+                    elif char == '\x1b[D':  # Left arrow - decrease value
+                        if self.settings_selected == 0:  # Refresh rate
+                            self.settings['refresh_rate'] = max(0.1, self.settings['refresh_rate'] - 0.1)
+                            self.refresh_rate = self.settings['refresh_rate']
+                        elif self.settings_selected == 1:  # Show icons
+                            self.settings['show_icons'] = not self.settings['show_icons']
+                        elif self.settings_selected == 2:  # Color theme
+                            themes = ["default", "minimal", "dark"]
+                            idx = themes.index(self.settings['color_theme'])
+                            self.settings['color_theme'] = themes[(idx - 1) % len(themes)]
+                        elif self.settings_selected == 3:  # Battery capacity
+                            self.settings['battery_capacity_mah'] = max(1000, self.settings['battery_capacity_mah'] - 500)
+                        return
+                    elif char == 'r' or char == 'R':  # Reset to defaults
+                        self.settings = {
+                            "refresh_rate": 0.5,
+                            "show_icons": True,
+                            "color_theme": "default",
+                            "battery_capacity_mah": 4000,
+                            "file_explorer_start": "/data/data/com.termux/files/home"
+                        }
+                        self.refresh_rate = 0.5
+                        return
                 
                 elif char == '\r' or char == '\n':  # Enter
                     if self.tabs[self.selected_tab][1] == "Storage":
