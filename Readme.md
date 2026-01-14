@@ -2,6 +2,8 @@
 
 A modern, feature-rich terminal UI dashboard for monitoring your Android device in Termux.
 
+<img width="940" height="587" alt="Screenshot 2026-01-14 at 4 26 45 PM" src="https://github.com/user-attachments/assets/62af69f5-a6e7-4bd5-b0d3-4c7d2c681de4" />
+
 ## Features
 
 - 📊 **System Overview** - At-a-glance view of CPU, memory, storage, battery, and network
@@ -68,7 +70,7 @@ monitor
 
 ## Screenshots
 
-<img width="940" height="587" alt="Screenshot 2026-01-14 at 4 26 45 PM" src="https://github.com/user-attachments/assets/62af69f5-a6e7-4bd5-b0d3-4c7d2c681de4" />
+<img width="980" height="621" alt="Screenshot 2026-01-14 at 4 32 42 PM" src="https://github.com/user-attachments/assets/d658be38-2782-4252-996a-0918a3f9692a" />
 
 
 The dashboard features:
