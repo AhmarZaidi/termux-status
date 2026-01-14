@@ -12,7 +12,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from threading import Thread, Lock
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 try:
     from rich.console import Console
@@ -53,6 +53,10 @@ class TermuxMonitor:
             "device": {}
         }
         
+        # For CPU calculation
+        self.last_cpu_check = time.time()
+        self.last_cpu_times = None
+        
         # Start data collection thread
         self.collector_thread = Thread(target=self._collect_data, daemon=True)
         self.collector_thread.start()
@@ -66,6 +70,62 @@ class TermuxMonitor:
         except Exception:
             pass
         return None
+    
+    def _get_cpu_usage_top(self) -> float:
+        """Get CPU usage using top command (Termux-compatible)"""
+        try:
+            result = subprocess.run(['top', '-bn1'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    if 'CPU:' in line or '%cpu' in line.lower():
+                        # Parse different top output formats
+                        parts = line.split()
+                        for i, part in enumerate(parts):
+                            if '%' in part and any(c.isdigit() for c in part):
+                                try:
+                                    return float(part.replace('%', ''))
+                                except ValueError:
+                                    pass
+        except Exception:
+            pass
+        return 0.0
+    
+    def _get_cpu_info_from_proc(self) -> Dict:
+        """Get CPU info from /proc/cpuinfo (read-only, should work)"""
+        cpu_count = 0
+        cpu_model = "Unknown"
+        
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.startswith('processor'):
+                        cpu_count += 1
+                    elif 'Hardware' in line and cpu_model == "Unknown":
+                        cpu_model = line.split(':')[1].strip()
+                    elif 'model name' in line and cpu_model == "Unknown":
+                        cpu_model = line.split(':')[1].strip()
+        except Exception:
+            pass
+        
+        return {
+            "count": cpu_count if cpu_count > 0 else os.cpu_count() or 1,
+            "model": cpu_model
+        }
+    
+    def _get_cpu_freq(self) -> Dict:
+        """Get CPU frequency from sysfs"""
+        try:
+            # Try to read current frequency
+            freq_path = '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'
+            if os.path.exists(freq_path):
+                with open(freq_path, 'r') as f:
+                    current_freq = int(f.read().strip()) / 1000  # Convert kHz to MHz
+                    return {"current": current_freq}
+        except Exception:
+            pass
+        return {"current": 0}
     
     def _get_termux_battery(self) -> Dict:
         """Get battery information from termux-battery-status"""
@@ -95,23 +155,79 @@ class TermuxMonitor:
     
     def _get_network_info(self) -> Dict:
         """Get network information"""
-        net_io = psutil.net_io_counters()
-        addrs = psutil.net_if_addrs()
+        try:
+            net_io = psutil.net_io_counters()
+            bytes_sent = net_io.bytes_sent
+            bytes_recv = net_io.bytes_recv
+            packets_sent = net_io.packets_sent
+            packets_recv = net_io.packets_recv
+        except Exception:
+            bytes_sent = bytes_recv = packets_sent = packets_recv = 0
         
         ip_addr = "N/A"
-        if "wlan0" in addrs:
-            for addr in addrs["wlan0"]:
-                if addr.family == 2:  # AF_INET
-                    ip_addr = addr.address
-                    break
+        try:
+            addrs = psutil.net_if_addrs()
+            if "wlan0" in addrs:
+                for addr in addrs["wlan0"]:
+                    if addr.family == 2:  # AF_INET
+                        ip_addr = addr.address
+                        break
+        except Exception:
+            pass
         
         return {
             "ip": ip_addr,
-            "bytes_sent": net_io.bytes_sent,
-            "bytes_recv": net_io.bytes_recv,
-            "packets_sent": net_io.packets_sent,
-            "packets_recv": net_io.packets_recv
+            "bytes_sent": bytes_sent,
+            "bytes_recv": bytes_recv,
+            "packets_sent": packets_sent,
+            "packets_recv": packets_recv
         }
+    
+    def _get_memory_info(self) -> Dict:
+        """Get memory info using /proc/meminfo (more reliable in Termux)"""
+        try:
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            return {
+                "total": mem.total,
+                "available": mem.available,
+                "used": mem.used,
+                "percent": mem.percent,
+                "swap_total": swap.total,
+                "swap_used": swap.used,
+                "swap_percent": swap.percent
+            }
+        except Exception:
+            # Fallback to reading /proc/meminfo directly
+            try:
+                mem_info = {}
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        parts = line.split(':')
+                        if len(parts) == 2:
+                            key = parts[0].strip()
+                            value = int(parts[1].strip().split()[0]) * 1024  # Convert KB to bytes
+                            mem_info[key] = value
+                
+                total = mem_info.get('MemTotal', 1)
+                available = mem_info.get('MemAvailable', mem_info.get('MemFree', 0))
+                used = total - available
+                percent = (used / total * 100) if total > 0 else 0
+                
+                return {
+                    "total": total,
+                    "available": available,
+                    "used": used,
+                    "percent": percent,
+                    "swap_total": mem_info.get('SwapTotal', 0),
+                    "swap_used": mem_info.get('SwapTotal', 0) - mem_info.get('SwapFree', 0),
+                    "swap_percent": 0
+                }
+            except Exception:
+                return {
+                    "total": 1, "available": 0, "used": 0, "percent": 0,
+                    "swap_total": 0, "swap_used": 0, "swap_percent": 0
+                }
     
     def _collect_data(self):
         """Background thread to collect system data"""
@@ -119,40 +235,37 @@ class TermuxMonitor:
         
         while self.running:
             try:
-                # CPU data
-                cpu_percent = psutil.cpu_percent(interval=0.1, percpu=True)
-                cpu_freq = psutil.cpu_freq()
+                # CPU data - use top command for Termux compatibility
+                cpu_info = self._get_cpu_info_from_proc()
+                cpu_usage = self._get_cpu_usage_top()
+                cpu_freq_info = self._get_cpu_freq()
                 
                 with self.data_lock:
                     self.system_data["cpu"] = {
-                        "percent": sum(cpu_percent) / len(cpu_percent),
-                        "per_core": cpu_percent,
-                        "count": psutil.cpu_count(),
-                        "freq": cpu_freq.current if cpu_freq else 0,
-                        "freq_max": cpu_freq.max if cpu_freq else 0
+                        "percent": cpu_usage,
+                        "per_core": [],  # Not easily available in Termux
+                        "count": cpu_info["count"],
+                        "model": cpu_info["model"],
+                        "freq": cpu_freq_info.get("current", 0),
+                        "freq_max": 0
                     }
                     
                     # Memory data
-                    mem = psutil.virtual_memory()
-                    swap = psutil.swap_memory()
-                    self.system_data["memory"] = {
-                        "total": mem.total,
-                        "available": mem.available,
-                        "used": mem.used,
-                        "percent": mem.percent,
-                        "swap_total": swap.total,
-                        "swap_used": swap.used,
-                        "swap_percent": swap.percent
-                    }
+                    self.system_data["memory"] = self._get_memory_info()
                     
                     # Storage data
-                    storage = psutil.disk_usage("/data")
-                    self.system_data["storage"] = {
-                        "total": storage.total,
-                        "used": storage.used,
-                        "free": storage.free,
-                        "percent": storage.percent
-                    }
+                    try:
+                        storage = psutil.disk_usage("/data")
+                        self.system_data["storage"] = {
+                            "total": storage.total,
+                            "used": storage.used,
+                            "free": storage.free,
+                            "percent": storage.percent
+                        }
+                    except Exception:
+                        self.system_data["storage"] = {
+                            "total": 1, "used": 0, "free": 1, "percent": 0
+                        }
                     
                     # Battery data
                     self.system_data["battery"] = self._get_termux_battery()
@@ -176,17 +289,40 @@ class TermuxMonitor:
                     if not self.system_data["device"]:
                         self.system_data["device"] = self._get_device_info()
                     
-                    # Process data
+                    # Process data - simplified for Termux
                     procs = []
-                    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                    try:
+                        result = subprocess.run(['ps', '-eo', 'pid,comm,%cpu,%mem'], 
+                                              capture_output=True, text=True, timeout=2)
+                        if result.returncode == 0:
+                            lines = result.stdout.strip().split('\n')[1:]  # Skip header
+                            for line in lines[:10]:
+                                parts = line.split(None, 3)
+                                if len(parts) >= 4:
+                                    try:
+                                        procs.append({
+                                            'pid': int(parts[0]),
+                                            'name': parts[1],
+                                            'cpu_percent': float(parts[2]),
+                                            'memory_percent': float(parts[3])
+                                        })
+                                    except ValueError:
+                                        pass
+                        procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
+                    except Exception:
+                        # Fallback to psutil if ps doesn't work
                         try:
-                            pinfo = proc.info
-                            if pinfo['cpu_percent'] is not None and pinfo['cpu_percent'] > 0:
-                                procs.append(pinfo)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                                try:
+                                    pinfo = proc.info
+                                    if pinfo.get('cpu_percent', 0) > 0:
+                                        procs.append(pinfo)
+                                except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+                                    pass
+                            procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
+                        except Exception:
                             pass
                     
-                    procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
                     self.system_data["processes"] = procs[:10]
                 
                 time.sleep(self.refresh_rate)
@@ -225,9 +361,21 @@ class TermuxMonitor:
     def _make_header_panel(self) -> Panel:
         """Create header with title and time"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        boot_time = datetime.fromtimestamp(psutil.boot_time())
-        uptime = datetime.now() - boot_time
-        uptime_str = str(uptime).split('.')[0]
+        
+        # Get uptime from /proc/uptime
+        uptime_str = "N/A"
+        try:
+            with open('/proc/uptime', 'r') as f:
+                uptime_seconds = float(f.read().split()[0])
+                uptime = timedelta(seconds=int(uptime_seconds))
+                uptime_str = str(uptime).split('.')[0]
+        except Exception:
+            try:
+                boot_time = datetime.fromtimestamp(psutil.boot_time())
+                uptime = datetime.now() - boot_time
+                uptime_str = str(uptime).split('.')[0]
+            except Exception:
+                pass
         
         header_text = Text()
         header_text.append("🚀 ", style="bold magenta")
@@ -322,40 +470,26 @@ class TermuxMonitor:
         with self.data_lock:
             cpu_data = self.system_data["cpu"].copy()
         
-        table = Table(show_header=True, box=box.SIMPLE)
-        table.add_column("Core", style="cyan", justify="center")
-        table.add_column("Usage", style="white", justify="right")
-        table.add_column("Bar", style="white", width=30)
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Metric", style="cyan", width=20)
+        table.add_column("Value", style="white")
         
-        per_core = cpu_data.get("per_core", [])
-        for i, usage in enumerate(per_core):
-            table.add_row(
-                f"Core {i}",
-                f"{usage:.1f}%",
-                self._create_progress_bar(usage)
-            )
-        
-        # Add summary
         avg_usage = cpu_data.get("percent", 0)
-        freq = cpu_data.get("freq", 0)
-        freq_max = cpu_data.get("freq_max", 0)
+        table.add_row("💻 CPU Usage", f"{avg_usage:.1f}%")
+        table.add_row("🔢 CPU Cores", str(cpu_data.get("count", 0)))
+        table.add_row("🏗️  Model", cpu_data.get("model", "Unknown")[:40])
         
-        info = Text()
-        info.append("\n")
-        info.append(f"Average Usage: ", style="dim")
-        info.append(f"{avg_usage:.1f}%\n", style="bold green")
-        info.append(f"CPU Cores: ", style="dim")
-        info.append(f"{cpu_data.get('count', 0)}\n", style="bold")
+        freq = cpu_data.get("freq", 0)
         if freq > 0:
-            info.append(f"Current Frequency: ", style="dim")
-            info.append(f"{freq:.0f} MHz\n", style="bold")
-        if freq_max > 0:
-            info.append(f"Max Frequency: ", style="dim")
-            info.append(f"{freq_max:.0f} MHz", style="bold")
+            table.add_row("⚡ Frequency", f"{freq:.0f} MHz")
+        
+        # Visual bar
+        bar_text = Text("\n")
+        bar_text.append(self._create_progress_bar(avg_usage, width=50))
         
         combined = Table.grid()
         combined.add_row(table)
-        combined.add_row(info)
+        combined.add_row(bar_text)
         
         return Panel(combined, title="[bold]💻 CPU Details[/bold]", box=box.ROUNDED)
     
@@ -517,6 +651,9 @@ class TermuxMonitor:
                 f"{proc.get('memory_percent', 0):.1f}"
             )
         
+        if not procs:
+            table.add_row("—", "No process data available", "—", "—")
+        
         return Panel(table, title="[bold]⚙️  Top Processes[/bold]", box=box.ROUNDED)
     
     def _get_content_panel(self) -> Panel:
@@ -610,6 +747,8 @@ def main():
         monitor.run()
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
