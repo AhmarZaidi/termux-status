@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import json
+import fcntl
 import subprocess
 from datetime import datetime, timedelta
 from threading import Thread, Lock
@@ -142,8 +143,8 @@ class TermuxMonitor:
         self.refresh_rate = 0.5
         
         # UI dimensions
-        self.ui_height = 28
-        self.sidebar_width = 6
+        self.ui_height = 20
+        self.sidebar_width = 8
         
         # File explorer
         self.file_explorer = FileExplorer()
@@ -503,7 +504,12 @@ class TermuxMonitor:
                 days = int(uptime_seconds // 86400)
                 hours = int((uptime_seconds % 86400) // 3600)
                 minutes = int((uptime_seconds % 3600) // 60)
-                uptime_str = f"{days}d {hours}h {minutes}m"
+                if days > 0:
+                    uptime_str = f"{days}d {hours}h {minutes}m"
+                elif hours > 0:
+                    uptime_str = f"{hours}h {minutes}m"
+                else:
+                    uptime_str = f"{minutes}m"
         except Exception:
             pass
         
@@ -536,8 +542,7 @@ class TermuxMonitor:
             tabs_text.append("\n\n")
         
         tabs_text.append("\n")
-        tabs_text.append("↑↓", style="dim cyan")
-        tabs_text.append("\n")
+        tabs_text.append("↑↓ ", style="dim cyan")
         tabs_text.append("q", style="dim red")
         
         return Panel(
@@ -949,7 +954,7 @@ class TermuxMonitor:
         
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="body", size=self.ui_height),
+            Layout(name="body"),
         )
         
         layout["body"].split_row(
@@ -977,7 +982,20 @@ class TermuxMonitor:
                 char = sys.stdin.read(1)
                 
                 if char == '\x1b':  # ESC sequence
-                    char += sys.stdin.read(2)
+                    # Try to read more characters (for arrow keys)
+                    old_flags = fcntl.fcntl(sys.stdin, fcntl.F_GETFL)
+                    fcntl.fcntl(sys.stdin, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+                    
+                    try:
+                        additional = sys.stdin.read(2)
+                        char += additional
+                    except:
+                        # No additional characters, it's ESC alone
+                        if self.file_explorer.focused:
+                            self.file_explorer.focused = False
+                            return
+                    finally:
+                        fcntl.fcntl(sys.stdin, fcntl.F_SETFL, old_flags)
                     
                     if self.file_explorer.focused:
                         if char == '\x1b[A':  # Up
