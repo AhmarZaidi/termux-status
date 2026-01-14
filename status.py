@@ -12,7 +12,8 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from threading import Thread, Lock
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
+from pathlib import Path
 
 try:
     from rich.console import Console
@@ -20,15 +21,105 @@ try:
     from rich.layout import Layout
     from rich.panel import Panel
     from rich.table import Table
-    from rich.progress import BarColumn, Progress, TextColumn
+    from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn
     from rich.text import Text
     from rich.align import Align
     from rich import box
+    from rich.columns import Columns
+    from rich.tree import Tree
     import psutil
 except ImportError:
     print("Missing dependencies. Install with:")
     print("pip install rich psutil")
     sys.exit(1)
+
+
+class FileExplorer:
+    """File explorer for storage tab"""
+    
+    def __init__(self, start_path="/data/data/com.termux/files/home"):
+        self.current_path = Path(start_path)
+        self.selected_index = 0
+        self.scroll_offset = 0
+        self.items = []
+        self.focused = False
+        self._refresh_items()
+    
+    def _refresh_items(self):
+        """Refresh directory listing"""
+        try:
+            self.items = [("📁", "..", self.current_path.parent, True, 0, 0)]
+            
+            # Get all items
+            all_items = []
+            for item in self.current_path.iterdir():
+                try:
+                    is_dir = item.is_dir()
+                    size = 0
+                    count = 0
+                    
+                    if is_dir:
+                        # Count items in directory
+                        try:
+                            count = len(list(item.iterdir()))
+                        except PermissionError:
+                            count = 0
+                        icon = "📁"
+                    else:
+                        size = item.stat().st_size
+                        icon = self._get_file_icon(item.name)
+                    
+                    all_items.append((icon, item.name, item, is_dir, size, count))
+                except PermissionError:
+                    pass
+            
+            # Sort: directories first, then by name
+            all_items.sort(key=lambda x: (not x[3], x[1].lower()))
+            self.items.extend(all_items)
+            
+        except PermissionError:
+            self.items = [("📁", "..", self.current_path.parent, True, 0, 0)]
+    
+    def _get_file_icon(self, filename: str) -> str:
+        """Get icon based on file extension"""
+        ext = filename.lower().split('.')[-1] if '.' in filename else ''
+        icons = {
+            'py': '🐍', 'sh': '📜', 'txt': '📄', 'md': '📝',
+            'jpg': '🖼️', 'png': '🖼️', 'gif': '🖼️',
+            'zip': '📦', 'tar': '📦', 'gz': '📦',
+            'mp3': '🎵', 'mp4': '🎬', 'pdf': '📕'
+        }
+        return icons.get(ext, '📄')
+    
+    def navigate_up(self):
+        if self.selected_index > 0:
+            self.selected_index -= 1
+    
+    def navigate_down(self):
+        if self.selected_index < len(self.items) - 1:
+            self.selected_index += 1
+    
+    def enter_item(self):
+        if self.items and self.selected_index < len(self.items):
+            _, name, path, is_dir, _, _ = self.items[self.selected_index]
+            if is_dir:
+                try:
+                    self.current_path = path
+                    self.selected_index = 0
+                    self.scroll_offset = 0
+                    self._refresh_items()
+                except PermissionError:
+                    pass
+    
+    def get_display_items(self, max_items: int = 15) -> List:
+        """Get items to display with scrolling"""
+        # Adjust scroll offset
+        if self.selected_index < self.scroll_offset:
+            self.scroll_offset = self.selected_index
+        elif self.selected_index >= self.scroll_offset + max_items:
+            self.scroll_offset = self.selected_index - max_items + 1
+        
+        return self.items[self.scroll_offset:self.scroll_offset + max_items]
 
 
 class TermuxMonitor:
@@ -39,8 +130,23 @@ class TermuxMonitor:
         self.data_lock = Lock()
         self.running = True
         self.selected_tab = 0
-        self.tabs = ["Overview", "CPU", "Memory", "Storage", "Battery", "Network", "Processes"]
-        self.refresh_rate = 0.5  # seconds
+        self.tabs = [
+            ("📊", "Overview"),
+            ("💻", "CPU"),
+            ("🧠", "Memory"),
+            ("💾", "Storage"),
+            ("🔋", "Battery"),
+            ("🌐", "Network"),
+            ("⚙️", "Processes")
+        ]
+        self.refresh_rate = 0.5
+        
+        # UI dimensions
+        self.ui_height = 28
+        self.sidebar_width = 6
+        
+        # File explorer
+        self.file_explorer = FileExplorer()
         
         # Cached data
         self.system_data = {
@@ -53,9 +159,9 @@ class TermuxMonitor:
             "device": {}
         }
         
-        # For CPU calculation
-        self.last_cpu_check = time.time()
-        self.last_cpu_times = None
+        # For CPU calculation using /proc/stat alternative
+        self.last_cpu_times = {"user": 0, "system": 0, "idle": 0}
+        self.last_net_io = {"sent": 0, "recv": 0, "time": time.time()}
         
         # Start data collection thread
         self.collector_thread = Thread(target=self._collect_data, daemon=True)
@@ -71,28 +177,44 @@ class TermuxMonitor:
             pass
         return None
     
-    def _get_cpu_usage_top(self) -> float:
-        """Get CPU usage using top command (Termux-compatible)"""
+    def _get_cpu_usage_from_times(self) -> Tuple[float, List[float]]:
+        """Calculate CPU usage from process times"""
         try:
-            result = subprocess.run(['top', '-bn1'], capture_output=True, text=True, timeout=2)
-            if result.returncode == 0:
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'CPU:' in line or '%cpu' in line.lower():
-                        # Parse different top output formats
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if '%' in part and any(c.isdigit() for c in part):
-                                try:
-                                    return float(part.replace('%', ''))
-                                except ValueError:
-                                    pass
+            # Get CPU times for all processes
+            total_user = 0
+            total_system = 0
+            
+            for proc in psutil.process_iter(['cpu_times']):
+                try:
+                    times = proc.info['cpu_times']
+                    if times:
+                        total_user += times.user
+                        total_system += times.system
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            # Calculate delta
+            user_delta = total_user - self.last_cpu_times["user"]
+            system_delta = total_system - self.last_cpu_times["system"]
+            
+            # Update last values
+            self.last_cpu_times = {
+                "user": total_user,
+                "system": total_system,
+                "idle": 0
+            }
+            
+            # Calculate percentage (rough estimate)
+            total_delta = user_delta + system_delta
+            cpu_percent = min(100.0, (total_delta / self.refresh_rate) * 10)  # Adjust multiplier as needed
+            
+            return cpu_percent, []
+            
         except Exception:
-            pass
-        return 0.0
+            return 0.0, []
     
     def _get_cpu_info_from_proc(self) -> Dict:
-        """Get CPU info from /proc/cpuinfo (read-only, should work)"""
+        """Get CPU info from /proc/cpuinfo"""
         cpu_count = 0
         cpu_model = "Unknown"
         
@@ -115,32 +237,62 @@ class TermuxMonitor:
         }
     
     def _get_cpu_freq(self) -> Dict:
-        """Get CPU frequency from sysfs"""
+        """Get CPU frequency from sysfs for all cores"""
+        freqs = []
         try:
-            # Try to read current frequency
-            freq_path = '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'
-            if os.path.exists(freq_path):
-                with open(freq_path, 'r') as f:
-                    current_freq = int(f.read().strip()) / 1000  # Convert kHz to MHz
-                    return {"current": current_freq}
+            cpu_count = os.cpu_count() or 1
+            for i in range(cpu_count):
+                freq_path = f'/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq'
+                if os.path.exists(freq_path):
+                    with open(freq_path, 'r') as f:
+                        freq = int(f.read().strip()) / 1000  # kHz to MHz
+                        freqs.append(freq)
         except Exception:
             pass
-        return {"current": 0}
+        
+        return {
+            "freqs": freqs,
+            "avg": sum(freqs) / len(freqs) if freqs else 0,
+            "max_freq": max(freqs) if freqs else 0
+        }
     
     def _get_termux_battery(self) -> Dict:
         """Get battery information from termux-battery-status"""
         data = self._safe_cmd(["termux-battery-status"], parse_json=True)
         if data:
+            percentage = data.get("percentage", 0)
+            status = data.get("status", "Unknown")
+            current = data.get("current", 0)  # in microamps, negative when discharging
+            
+            # Estimate time remaining (rough calculation)
+            time_remaining = "N/A"
+            if current != 0:
+                # Assume typical battery capacity (you may need to adjust this)
+                battery_capacity_mah = 4000  # Adjust based on your device
+                
+                if "CHARGING" in status.upper() and current > 0:
+                    remaining_capacity = battery_capacity_mah * (100 - percentage) / 100
+                    hours_remaining = remaining_capacity / (current / 1000)
+                    time_remaining = f"{int(hours_remaining)}h {int((hours_remaining % 1) * 60)}m"
+                elif "DISCHARGING" in status.upper() and current < 0:
+                    remaining_capacity = battery_capacity_mah * percentage / 100
+                    hours_remaining = remaining_capacity / (abs(current) / 1000)
+                    time_remaining = f"{int(hours_remaining)}h {int((hours_remaining % 1) * 60)}m"
+            
             return {
-                "percentage": data.get("percentage", 0),
-                "status": data.get("status", "Unknown"),
+                "percentage": percentage,
+                "status": status,
                 "health": data.get("health", "Unknown"),
                 "temperature": data.get("temperature", 0),
                 "plugged": data.get("plugged", "Unknown"),
-                "current": data.get("current", 0)
+                "current": current,
+                "time_remaining": time_remaining
             }
-        return {"percentage": 0, "status": "N/A", "health": "N/A", 
-                "temperature": 0, "plugged": "N/A", "current": 0}
+        return {
+            "percentage": 0, "status": "N/A", "health": "N/A",
+            "temperature": 0, "plugged": "N/A", "current": 0,
+            "time_remaining": "N/A"
+        }
     
     def _get_device_info(self) -> Dict:
         """Get Android device information"""
@@ -161,30 +313,43 @@ class TermuxMonitor:
             bytes_recv = net_io.bytes_recv
             packets_sent = net_io.packets_sent
             packets_recv = net_io.packets_recv
+            errin = net_io.errin
+            errout = net_io.errout
+            dropin = net_io.dropin
+            dropout = net_io.dropout
         except Exception:
             bytes_sent = bytes_recv = packets_sent = packets_recv = 0
+            errin = errout = dropin = dropout = 0
         
+        # Get IP addresses
         ip_addr = "N/A"
+        ip_addr_v6 = "N/A"
         try:
             addrs = psutil.net_if_addrs()
             if "wlan0" in addrs:
                 for addr in addrs["wlan0"]:
-                    if addr.family == 2:  # AF_INET
+                    if addr.family == 2:  # AF_INET (IPv4)
                         ip_addr = addr.address
-                        break
+                    elif addr.family == 10:  # AF_INET6 (IPv6)
+                        ip_addr_v6 = addr.address
         except Exception:
             pass
         
         return {
             "ip": ip_addr,
+            "ip_v6": ip_addr_v6,
             "bytes_sent": bytes_sent,
             "bytes_recv": bytes_recv,
             "packets_sent": packets_sent,
-            "packets_recv": packets_recv
+            "packets_recv": packets_recv,
+            "errors_in": errin,
+            "errors_out": errout,
+            "drops_in": dropin,
+            "drops_out": dropout
         }
     
     def _get_memory_info(self) -> Dict:
-        """Get memory info using /proc/meminfo (more reliable in Termux)"""
+        """Get memory info"""
         try:
             mem = psutil.virtual_memory()
             swap = psutil.swap_memory()
@@ -193,61 +358,38 @@ class TermuxMonitor:
                 "available": mem.available,
                 "used": mem.used,
                 "percent": mem.percent,
+                "buffers": getattr(mem, 'buffers', 0),
+                "cached": getattr(mem, 'cached', 0),
                 "swap_total": swap.total,
                 "swap_used": swap.used,
                 "swap_percent": swap.percent
             }
         except Exception:
-            # Fallback to reading /proc/meminfo directly
-            try:
-                mem_info = {}
-                with open('/proc/meminfo', 'r') as f:
-                    for line in f:
-                        parts = line.split(':')
-                        if len(parts) == 2:
-                            key = parts[0].strip()
-                            value = int(parts[1].strip().split()[0]) * 1024  # Convert KB to bytes
-                            mem_info[key] = value
-                
-                total = mem_info.get('MemTotal', 1)
-                available = mem_info.get('MemAvailable', mem_info.get('MemFree', 0))
-                used = total - available
-                percent = (used / total * 100) if total > 0 else 0
-                
-                return {
-                    "total": total,
-                    "available": available,
-                    "used": used,
-                    "percent": percent,
-                    "swap_total": mem_info.get('SwapTotal', 0),
-                    "swap_used": mem_info.get('SwapTotal', 0) - mem_info.get('SwapFree', 0),
-                    "swap_percent": 0
-                }
-            except Exception:
-                return {
-                    "total": 1, "available": 0, "used": 0, "percent": 0,
-                    "swap_total": 0, "swap_used": 0, "swap_percent": 0
-                }
+            return {
+                "total": 1, "available": 0, "used": 0, "percent": 0,
+                "buffers": 0, "cached": 0,
+                "swap_total": 0, "swap_used": 0, "swap_percent": 0
+            }
     
     def _collect_data(self):
         """Background thread to collect system data"""
-        last_net = {"sent": 0, "recv": 0, "time": time.time()}
         
         while self.running:
             try:
-                # CPU data - use top command for Termux compatibility
+                # CPU data
                 cpu_info = self._get_cpu_info_from_proc()
-                cpu_usage = self._get_cpu_usage_top()
+                cpu_usage, per_core = self._get_cpu_usage_from_times()
                 cpu_freq_info = self._get_cpu_freq()
                 
                 with self.data_lock:
                     self.system_data["cpu"] = {
                         "percent": cpu_usage,
-                        "per_core": [],  # Not easily available in Termux
+                        "per_core": per_core,
                         "count": cpu_info["count"],
                         "model": cpu_info["model"],
-                        "freq": cpu_freq_info.get("current", 0),
-                        "freq_max": 0
+                        "freqs": cpu_freq_info.get("freqs", []),
+                        "freq_avg": cpu_freq_info.get("avg", 0),
+                        "freq_max": cpu_freq_info.get("max_freq", 0)
                     }
                     
                     # Memory data
@@ -273,57 +415,41 @@ class TermuxMonitor:
                     # Network data with speed calculation
                     net_info = self._get_network_info()
                     current_time = time.time()
-                    time_diff = current_time - last_net["time"]
+                    time_diff = current_time - self.last_net_io["time"]
                     
-                    net_info["speed_up"] = (net_info["bytes_sent"] - last_net["sent"]) / time_diff if time_diff > 0 else 0
-                    net_info["speed_down"] = (net_info["bytes_recv"] - last_net["recv"]) / time_diff if time_diff > 0 else 0
+                    if time_diff > 0:
+                        net_info["speed_up"] = (net_info["bytes_sent"] - self.last_net_io["sent"]) / time_diff
+                        net_info["speed_down"] = (net_info["bytes_recv"] - self.last_net_io["recv"]) / time_diff
+                    else:
+                        net_info["speed_up"] = 0
+                        net_info["speed_down"] = 0
                     
-                    last_net = {
+                    self.last_net_io = {
                         "sent": net_info["bytes_sent"],
                         "recv": net_info["bytes_recv"],
                         "time": current_time
                     }
                     self.system_data["network"] = net_info
                     
-                    # Device info (static, update less frequently)
+                    # Device info (static)
                     if not self.system_data["device"]:
                         self.system_data["device"] = self._get_device_info()
                     
-                    # Process data - simplified for Termux
+                    # Process data
                     procs = []
                     try:
-                        result = subprocess.run(['ps', '-eo', 'pid,comm,%cpu,%mem'], 
-                                              capture_output=True, text=True, timeout=2)
-                        if result.returncode == 0:
-                            lines = result.stdout.strip().split('\n')[1:]  # Skip header
-                            for line in lines[:10]:
-                                parts = line.split(None, 3)
-                                if len(parts) >= 4:
-                                    try:
-                                        procs.append({
-                                            'pid': int(parts[0]),
-                                            'name': parts[1],
-                                            'cpu_percent': float(parts[2]),
-                                            'memory_percent': float(parts[3])
-                                        })
-                                    except ValueError:
-                                        pass
-                        procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
+                        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']):
+                            try:
+                                pinfo = proc.info
+                                procs.append(pinfo)
+                            except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+                                pass
+                        
+                        procs.sort(key=lambda x: x.get('cpu_percent', 0) or 0, reverse=True)
                     except Exception:
-                        # Fallback to psutil if ps doesn't work
-                        try:
-                            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-                                try:
-                                    pinfo = proc.info
-                                    if pinfo.get('cpu_percent', 0) > 0:
-                                        procs.append(pinfo)
-                                except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
-                                    pass
-                            procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
-                        except Exception:
-                            pass
+                        pass
                     
-                    self.system_data["processes"] = procs[:10]
+                    self.system_data["processes"] = procs[:15]
                 
                 time.sleep(self.refresh_rate)
                 
@@ -342,131 +468,177 @@ class TermuxMonitor:
         """Format network speed"""
         return f"{self._format_bytes(bytes_per_sec)}/s"
     
-    def _create_progress_bar(self, value: float, total: float = 100, width: int = 30) -> str:
-        """Create a colored progress bar"""
-        percent = (value / total * 100) if total > 0 else 0
-        filled = int(width * value / total) if total > 0 else 0
+    def _create_bar(self, percentage: float, width: int = 20, show_percent: bool = True) -> Text:
+        """Create a visual progress bar with actual colors"""
+        filled = int(width * percentage / 100)
+        empty = width - filled
         
-        # Color based on percentage
-        if percent >= 90:
+        # Determine color
+        if percentage >= 90:
             color = "red"
-        elif percent >= 70:
+        elif percentage >= 70:
             color = "yellow"
         else:
             color = "green"
         
-        bar = "█" * filled + "░" * (width - filled)
-        return f"[{color}]{bar}[/{color}]"
-    
-    def _make_header_panel(self) -> Panel:
-        """Create header with title and time"""
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bar = Text()
+        bar.append("█" * filled, style=color)
+        bar.append("░" * empty, style="dim")
         
-        # Get uptime from /proc/uptime
+        if show_percent:
+            bar.append(f" {percentage:.1f}%", style="white")
+        
+        return bar
+    
+    def _make_header(self) -> Panel:
+        """Create header"""
+        current_time = datetime.now().strftime("%H:%M:%S")
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Get uptime
         uptime_str = "N/A"
         try:
             with open('/proc/uptime', 'r') as f:
                 uptime_seconds = float(f.read().split()[0])
-                uptime = timedelta(seconds=int(uptime_seconds))
-                uptime_str = str(uptime).split('.')[0]
+                days = int(uptime_seconds // 86400)
+                hours = int((uptime_seconds % 86400) // 3600)
+                minutes = int((uptime_seconds % 3600) // 60)
+                uptime_str = f"{days}d {hours}h {minutes}m"
         except Exception:
-            try:
-                boot_time = datetime.fromtimestamp(psutil.boot_time())
-                uptime = datetime.now() - boot_time
-                uptime_str = str(uptime).split('.')[0]
-            except Exception:
-                pass
+            pass
         
         header_text = Text()
         header_text.append("🚀 ", style="bold magenta")
-        header_text.append("Termux System Monitor", style="bold cyan")
-        header_text.append(f"  •  {current_time}", style="dim")
-        header_text.append(f"  •  ⏱️  Uptime: {uptime_str}", style="green")
+        header_text.append("Termux Monitor", style="bold cyan")
+        header_text.append("  │  ", style="dim")
+        header_text.append(f"📅 {current_date}", style="blue")
+        header_text.append("  ", style="dim")
+        header_text.append(f"🕐 {current_time}", style="green")
+        header_text.append("  │  ", style="dim")
+        header_text.append(f"⏱  {uptime_str}", style="yellow")
         
-        return Panel(Align.center(header_text), box=box.ROUNDED, style="cyan")
+        return Panel(
+            Align.center(header_text),
+            box=box.ROUNDED,
+            style="cyan",
+            padding=(0, 1)
+        )
     
-    def _make_tabs_panel(self) -> Panel:
-        """Create tabs navigation panel"""
+    def _make_sidebar(self) -> Panel:
+        """Create sidebar with icon tabs"""
         tabs_text = Text()
-        for i, tab in enumerate(self.tabs):
+        
+        for i, (icon, name) in enumerate(self.tabs):
             if i == self.selected_tab:
-                tabs_text.append(f" ▶ {tab} ", style="bold green on black")
+                tabs_text.append(f" {icon} ", style="bold white on blue")
             else:
-                tabs_text.append(f"   {tab} ", style="dim")
-            tabs_text.append("\n")
+                tabs_text.append(f" {icon} ", style="dim")
+            tabs_text.append("\n\n")
         
-        tabs_text.append("\n", style="dim")
-        tabs_text.append("↑/↓: Navigate  q: Quit", style="dim italic")
+        tabs_text.append("\n")
+        tabs_text.append("↑↓", style="dim cyan")
+        tabs_text.append("\n")
+        tabs_text.append("q", style="dim red")
         
-        return Panel(tabs_text, title="[bold]Navigation[/bold]", box=box.ROUNDED, style="blue")
+        return Panel(
+            Align.center(tabs_text),
+            box=box.ROUNDED,
+            style="blue",
+            padding=(0, 0)
+        )
     
     def _make_overview_panel(self) -> Panel:
         """Create overview panel"""
         with self.data_lock:
             data = self.system_data.copy()
         
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column("Metric", style="cyan", width=20)
-        table.add_column("Value", style="white")
-        table.add_column("Bar", style="white", width=35)
+        # Create grid layout
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="left")
+        grid.add_column(justify="left")
         
-        # CPU
+        # Row 1: CPU and Memory
         cpu_pct = data["cpu"].get("percent", 0)
-        table.add_row(
-            "💻 CPU Usage",
-            f"{cpu_pct:.1f}%",
-            self._create_progress_bar(cpu_pct)
-        )
+        cpu_text = Text()
+        cpu_text.append("💻 CPU\n", style="bold cyan")
+        cpu_text.append(self._create_bar(cpu_pct, width=25))
         
-        # Memory
         mem_pct = data["memory"].get("percent", 0)
-        mem_used = self._format_bytes(data["memory"].get("used", 0))
-        mem_total = self._format_bytes(data["memory"].get("total", 1))
-        table.add_row(
-            "🧠 Memory",
-            f"{mem_used} / {mem_total}",
-            self._create_progress_bar(mem_pct)
-        )
+        mem_text = Text()
+        mem_text.append("🧠 Memory\n", style="bold cyan")
+        mem_text.append(self._create_bar(mem_pct, width=25))
         
-        # Storage
+        grid.add_row(cpu_text, mem_text)
+        grid.add_row("", "")
+        
+        # Row 2: Storage and Battery
         stor_pct = data["storage"].get("percent", 0)
-        stor_used = self._format_bytes(data["storage"].get("used", 0))
-        stor_total = self._format_bytes(data["storage"].get("total", 1))
-        table.add_row(
-            "💾 Storage",
-            f"{stor_used} / {stor_total}",
-            self._create_progress_bar(stor_pct)
-        )
+        stor_text = Text()
+        stor_text.append("💾 Storage\n", style="bold cyan")
+        stor_text.append(self._create_bar(stor_pct, width=25))
         
-        # Battery
         bat_pct = data["battery"].get("percentage", 0)
-        bat_status = data["battery"].get("status", "N/A")
-        bat_icon = "⚡" if "CHARGING" in bat_status.upper() else "🔋" if bat_pct > 20 else "🪫"
-        table.add_row(
-            f"{bat_icon} Battery",
-            f"{bat_pct}% ({bat_status})",
-            self._create_progress_bar(bat_pct)
-        )
+        bat_text = Text()
+        bat_text.append("🔋 Battery\n", style="bold cyan")
+        bat_text.append(self._create_bar(bat_pct, width=25))
         
-        # Network speeds
-        net_up = self._format_speed(data["network"].get("speed_up", 0))
-        net_down = self._format_speed(data["network"].get("speed_down", 0))
-        table.add_row("", "", "")
-        table.add_row("📤 Upload Speed", net_up, "")
-        table.add_row("📥 Download Speed", net_down, "")
+        grid.add_row(stor_text, bat_text)
+        grid.add_row("", "")
+        
+        # Network info
+        net_text = Text()
+        net_text.append("🌐 Network\n", style="bold cyan")
+        net_text.append(f"↑ {self._format_speed(data['network'].get('speed_up', 0))}  ", style="green")
+        net_text.append(f"↓ {self._format_speed(data['network'].get('speed_down', 0))}", style="blue")
         
         # Device info
         device = data["device"]
-        table.add_row("", "", "")
-        table.add_row("📱 Device", f"{device.get('manufacturer', '')} {device.get('model', '')}", "")
-        table.add_row("🤖 Android", f"Version {device.get('android', '')} (SDK {device.get('sdk', '')})", "")
-        table.add_row("🏗️  Architecture", device.get('arch', 'N/A'), "")
-        table.add_row("🌐 IP Address", data["network"].get("ip", "N/A"), "")
+        device_text = Text()
+        device_text.append("📱 Device\n", style="bold cyan")
+        device_text.append(f"{device.get('manufacturer', '')} {device.get('model', '')}\n", style="white")
+        device_text.append(f"Android {device.get('android', '')} • {device.get('arch', '')}", style="dim")
         
-        return Panel(table, title="[bold]📊 System Overview[/bold]", box=box.ROUNDED)
+        grid.add_row(net_text, device_text)
+        
+        # Detailed stats table
+        stats = Table(show_header=False, box=None, padding=(0, 1))
+        stats.add_column("Label", style="dim", width=15)
+        stats.add_column("Value", style="white")
+        stats.add_column("Label2", style="dim", width=15)
+        stats.add_column("Value2", style="white")
+        
+        stats.add_row(
+            "CPU Cores", str(data["cpu"].get("count", 0)),
+            "Memory Total", self._format_bytes(data["memory"].get("total", 0))
+        )
+        stats.add_row(
+            "CPU Freq", f"{data['cpu'].get('freq_avg', 0):.0f} MHz",
+            "Memory Used", self._format_bytes(data["memory"].get("used", 0))
+        )
+        stats.add_row(
+            "Storage Total", self._format_bytes(data["storage"].get("total", 0)),
+            "Storage Free", self._format_bytes(data["storage"].get("free", 0))
+        )
+        stats.add_row(
+            "IP Address", data["network"].get("ip", "N/A"),
+            "Battery Status", data["battery"].get("status", "N/A")
+        )
+        
+        # Combine everything
+        content = Table.grid()
+        content.add_row(grid)
+        content.add_row("")
+        content.add_row(stats)
+        
+        return Panel(
+            content,
+            title="[bold cyan]📊 System Overview[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _make_cpu_panel(self) -> Panel:
-        """Create detailed CPU panel"""
+        """Create CPU panel"""
         with self.data_lock:
             cpu_data = self.system_data["cpu"].copy()
         
@@ -474,109 +646,157 @@ class TermuxMonitor:
         table.add_column("Metric", style="cyan", width=20)
         table.add_column("Value", style="white")
         
-        avg_usage = cpu_data.get("percent", 0)
-        table.add_row("💻 CPU Usage", f"{avg_usage:.1f}%")
-        table.add_row("🔢 CPU Cores", str(cpu_data.get("count", 0)))
-        table.add_row("🏗️  Model", cpu_data.get("model", "Unknown")[:40])
+        usage = cpu_data.get("percent", 0)
+        table.add_row("💻 Usage", "")
+        table.add_row("", self._create_bar(usage, width=40))
+        table.add_row("", "")
         
-        freq = cpu_data.get("freq", 0)
-        if freq > 0:
-            table.add_row("⚡ Frequency", f"{freq:.0f} MHz")
+        table.add_row("🔢 Cores", str(cpu_data.get("count", 0)))
+        table.add_row("🏗️  Model", cpu_data.get("model", "Unknown")[:50])
         
-        # Visual bar
-        bar_text = Text("\n")
-        bar_text.append(self._create_progress_bar(avg_usage, width=50))
+        freq_avg = cpu_data.get("freq_avg", 0)
+        if freq_avg > 0:
+            table.add_row("⚡ Avg Frequency", f"{freq_avg:.0f} MHz")
         
-        combined = Table.grid()
-        combined.add_row(table)
-        combined.add_row(bar_text)
+        freq_max = cpu_data.get("freq_max", 0)
+        if freq_max > 0:
+            table.add_row("📊 Max Frequency", f"{freq_max:.0f} MHz")
         
-        return Panel(combined, title="[bold]💻 CPU Details[/bold]", box=box.ROUNDED)
+        # Show per-core frequencies if available
+        freqs = cpu_data.get("freqs", [])
+        if freqs:
+            table.add_row("", "")
+            table.add_row("⚙️  Core Frequencies", "")
+            for i, freq in enumerate(freqs[:8]):  # Show max 8 cores
+                table.add_row(f"   Core {i}", f"{freq:.0f} MHz")
+        
+        return Panel(
+            table,
+            title="[bold cyan]💻 CPU Details[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _make_memory_panel(self) -> Panel:
-        """Create detailed memory panel"""
+        """Create memory panel"""
         with self.data_lock:
             mem_data = self.system_data["memory"].copy()
         
+        # Main stats
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Type", style="cyan", width=15)
-        table.add_column("Used", style="white", width=12)
-        table.add_column("Total", style="white", width=12)
-        table.add_column("Percent", style="white", width=10)
-        table.add_column("Bar", style="white", width=30)
+        table.add_column("Details", style="white")
         
         # RAM
+        table.add_row("🧠 RAM", "")
         table.add_row(
-            "🧠 RAM",
-            self._format_bytes(mem_data.get("used", 0)),
-            self._format_bytes(mem_data.get("total", 1)),
-            f"{mem_data.get('percent', 0):.1f}%",
-            self._create_progress_bar(mem_data.get("percent", 0))
+            "   Used",
+            f"{self._format_bytes(mem_data.get('used', 0))} / {self._format_bytes(mem_data.get('total', 1))}"
         )
+        table.add_row("", self._create_bar(mem_data.get("percent", 0), width=40))
+        table.add_row("   Available", self._format_bytes(mem_data.get("available", 0)))
         
-        # Available
-        table.add_row(
-            "  Available",
-            self._format_bytes(mem_data.get("available", 0)),
-            "",
-            "",
-            ""
-        )
+        cached = mem_data.get("cached", 0)
+        if cached > 0:
+            table.add_row("   Cached", self._format_bytes(cached))
         
-        table.add_row("", "", "", "", "")
+        buffers = mem_data.get("buffers", 0)
+        if buffers > 0:
+            table.add_row("   Buffers", self._format_bytes(buffers))
+        
+        table.add_row("", "")
         
         # Swap
         swap_total = mem_data.get("swap_total", 0)
         if swap_total > 0:
+            table.add_row("💿 Swap", "")
             table.add_row(
-                "💿 Swap",
-                self._format_bytes(mem_data.get("swap_used", 0)),
-                self._format_bytes(swap_total),
-                f"{mem_data.get('swap_percent', 0):.1f}%",
-                self._create_progress_bar(mem_data.get("swap_percent", 0))
+                "   Used",
+                f"{self._format_bytes(mem_data.get('swap_used', 0))} / {self._format_bytes(swap_total)}"
             )
+            table.add_row("", self._create_bar(mem_data.get("swap_percent", 0), width=40))
         else:
-            table.add_row("💿 Swap", "Not configured", "", "", "")
+            table.add_row("💿 Swap", "Not configured")
         
-        return Panel(table, title="[bold]🧠 Memory Details[/bold]", box=box.ROUNDED)
+        return Panel(
+            table,
+            title="[bold cyan]🧠 Memory Details[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _make_storage_panel(self) -> Panel:
-        """Create storage panel"""
-        with self.data_lock:
-            stor_data = self.system_data["storage"].copy()
-        
-        table = Table(show_header=False, box=None, padding=(0, 2))
-        table.add_column("Metric", style="cyan", width=20)
-        table.add_column("Value", style="white")
-        
-        table.add_row("💾 Total Space", self._format_bytes(stor_data.get("total", 0)))
-        table.add_row("📊 Used Space", self._format_bytes(stor_data.get("used", 0)))
-        table.add_row("📂 Free Space", self._format_bytes(stor_data.get("free", 0)))
-        table.add_row("📈 Usage Percent", f"{stor_data.get('percent', 0):.1f}%")
-        
-        # Visual bar
-        bar_text = Text("\n")
-        bar_text.append(self._create_progress_bar(stor_data.get("percent", 0), width=50))
-        
-        combined = Table.grid()
-        combined.add_row(table)
-        combined.add_row(bar_text)
-        
-        return Panel(combined, title="[bold]💾 Storage Details[/bold]", box=box.ROUNDED)
+        """Create storage panel with file explorer"""
+        if not self.file_explorer.focused:
+            # Show storage stats
+            with self.data_lock:
+                stor_data = self.system_data["storage"].copy()
+            
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column("Metric", style="cyan", width=20)
+            table.add_column("Value", style="white")
+            
+            table.add_row("💾 Total Space", self._format_bytes(stor_data.get("total", 0)))
+            table.add_row("📊 Used Space", self._format_bytes(stor_data.get("used", 0)))
+            table.add_row("📂 Free Space", self._format_bytes(stor_data.get("free", 0)))
+            table.add_row("", "")
+            table.add_row("", self._create_bar(stor_data.get("percent", 0), width=40))
+            table.add_row("", "")
+            table.add_row("", "")
+            table.add_row("💡 Tip", "Press Enter to browse files", style="dim italic")
+            
+            return Panel(
+                table,
+                title="[bold cyan]💾 Storage Details[/bold cyan]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
+        else:
+            # Show file explorer
+            table = Table(show_header=True, box=box.SIMPLE, padding=(0, 1))
+            table.add_column("", width=3, style="white")
+            table.add_column("Name", style="white", overflow="fold")
+            table.add_column("Size/Items", style="dim", justify="right", width=12)
+            
+            items = self.file_explorer.get_display_items(max_items=18)
+            for i, (icon, name, path, is_dir, size, count) in enumerate(items):
+                actual_index = self.file_explorer.scroll_offset + i
+                marker = "▶" if actual_index == self.file_explorer.selected_index else " "
+                
+                if is_dir:
+                    size_str = f"{count} items" if name != ".." else ""
+                    style = "bold blue" if actual_index == self.file_explorer.selected_index else "blue"
+                else:
+                    size_str = self._format_bytes(size)
+                    style = "bold white" if actual_index == self.file_explorer.selected_index else "white"
+                
+                table.add_row(marker, f"{icon} {name[:40]}", size_str, style=style)
+            
+            path_text = Text()
+            path_text.append(f"📁 {self.file_explorer.current_path}\n", style="bold cyan")
+            path_text.append("↑↓: Navigate  Enter: Open  Esc: Back  q: Quit", style="dim italic")
+            
+            content = Table.grid()
+            content.add_row(path_text)
+            content.add_row("")
+            content.add_row(table)
+            
+            return Panel(
+                content,
+                title="[bold cyan]📂 File Explorer[/bold cyan]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            )
     
     def _make_battery_panel(self) -> Panel:
-        """Create detailed battery panel"""
+        """Create battery panel"""
         with self.data_lock:
             bat_data = self.system_data["battery"].copy()
-        
-        table = Table(show_header=False, box=None, padding=(0, 2))
-        table.add_column("Metric", style="cyan", width=20)
-        table.add_column("Value", style="white")
         
         percentage = bat_data.get("percentage", 0)
         status = bat_data.get("status", "N/A")
         
-        # Icon based on status
+        # Icon and color
         if "CHARGING" in status.upper():
             icon = "⚡"
             color = "yellow"
@@ -590,7 +810,14 @@ class TermuxMonitor:
             icon = "🪫"
             color = "red"
         
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Metric", style="cyan", width=20)
+        table.add_column("Value", style="white")
+        
         table.add_row(f"{icon} Charge Level", f"[{color}]{percentage}%[/{color}]")
+        table.add_row("", self._create_bar(percentage, width=40, show_percent=False))
+        table.add_row("", "")
+        
         table.add_row("⚙️  Status", status)
         table.add_row("💚 Health", bat_data.get("health", "N/A"))
         table.add_row("🌡️  Temperature", f"{bat_data.get('temperature', 0):.1f}°C")
@@ -598,67 +825,106 @@ class TermuxMonitor:
         
         current = bat_data.get("current", 0)
         if current != 0:
-            table.add_row("⚡ Current", f"{current} mA")
+            table.add_row("⚡ Current", f"{current} µA")
         
-        # Visual bar
-        bar_text = Text("\n")
-        bar_text.append(self._create_progress_bar(percentage, width=50))
+        time_remaining = bat_data.get("time_remaining", "N/A")
+        if time_remaining != "N/A":
+            if "CHARGING" in status.upper():
+                table.add_row("⏱️  Time to Full", time_remaining)
+            elif "DISCHARGING" in status.upper():
+                table.add_row("⏱️  Time Remaining", time_remaining)
         
-        combined = Table.grid()
-        combined.add_row(table)
-        combined.add_row(bar_text)
-        
-        return Panel(combined, title="[bold]🔋 Battery Details[/bold]", box=box.ROUNDED)
+        return Panel(
+            table,
+            title="[bold cyan]🔋 Battery Details[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _make_network_panel(self) -> Panel:
         """Create network panel"""
         with self.data_lock:
             net_data = self.system_data["network"].copy()
         
-        table = Table(show_header=False, box=None, padding=(0, 2))
-        table.add_column("Metric", style="cyan", width=25)
-        table.add_column("Value", style="white")
+        # Speed section
+        speed_table = Table(show_header=False, box=None, padding=(0, 2))
+        speed_table.add_column("Direction", style="cyan", width=20)
+        speed_table.add_column("Speed", style="white")
         
-        table.add_row("🌐 IP Address", net_data.get("ip", "N/A"))
-        table.add_row("", "")
-        table.add_row("📤 Upload Speed", f"[green]{self._format_speed(net_data.get('speed_up', 0))}[/green]")
-        table.add_row("📥 Download Speed", f"[blue]{self._format_speed(net_data.get('speed_down', 0))}[/blue]")
-        table.add_row("", "")
-        table.add_row("📊 Total Sent", self._format_bytes(net_data.get("bytes_sent", 0)))
-        table.add_row("📊 Total Received", self._format_bytes(net_data.get("bytes_recv", 0)))
-        table.add_row("", "")
-        table.add_row("📦 Packets Sent", f"{net_data.get('packets_sent', 0):,}")
-        table.add_row("📦 Packets Received", f"{net_data.get('packets_recv', 0):,}")
+        speed_table.add_row("📤 Upload Speed", f"[green]{self._format_speed(net_data.get('speed_up', 0))}[/green]")
+        speed_table.add_row("📥 Download Speed", f"[blue]{self._format_speed(net_data.get('speed_down', 0))}[/blue]")
         
-        return Panel(table, title="[bold]🌐 Network Details[/bold]", box=box.ROUNDED)
+        # Stats section
+        stats_table = Table(show_header=False, box=None, padding=(0, 2))
+        stats_table.add_column("Metric", style="cyan", width=20)
+        stats_table.add_column("Value", style="white")
+        
+        stats_table.add_row("", "")
+        stats_table.add_row("🌐 IP Address (v4)", net_data.get("ip", "N/A"))
+        stats_table.add_row("🌐 IP Address (v6)", net_data.get("ip_v6", "N/A")[:40])
+        stats_table.add_row("", "")
+        stats_table.add_row("📊 Total Sent", self._format_bytes(net_data.get("bytes_sent", 0)))
+        stats_table.add_row("📊 Total Received", self._format_bytes(net_data.get("bytes_recv", 0)))
+        stats_table.add_row("", "")
+        stats_table.add_row("📦 Packets Sent", f"{net_data.get('packets_sent', 0):,}")
+        stats_table.add_row("📦 Packets Received", f"{net_data.get('packets_recv', 0):,}")
+        
+        errors_in = net_data.get("errors_in", 0)
+        errors_out = net_data.get("errors_out", 0)
+        if errors_in > 0 or errors_out > 0:
+            stats_table.add_row("", "")
+            stats_table.add_row("⚠️  Errors In", str(errors_in))
+            stats_table.add_row("⚠️  Errors Out", str(errors_out))
+        
+        # Combine
+        content = Table.grid()
+        content.add_row(speed_table)
+        content.add_row(stats_table)
+        
+        return Panel(
+            content,
+            title="[bold cyan]🌐 Network Details[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _make_processes_panel(self) -> Panel:
-        """Create top processes panel"""
+        """Create processes panel"""
         with self.data_lock:
-            procs = self.system_data["processes"][:10]
+            procs = self.system_data["processes"][:12]
         
         table = Table(show_header=True, box=box.SIMPLE)
         table.add_column("PID", style="cyan", justify="right", width=8)
-        table.add_column("Name", style="white", width=30)
-        table.add_column("CPU %", style="yellow", justify="right", width=10)
-        table.add_column("MEM %", style="green", justify="right", width=10)
+        table.add_column("Name", style="white", width=25, overflow="fold")
+        table.add_column("CPU%", style="yellow", justify="right", width=8)
+        table.add_column("MEM%", style="green", justify="right", width=8)
+        table.add_column("Status", style="dim", width=10)
         
         for proc in procs:
+            cpu_pct = proc.get('cpu_percent') or 0
+            mem_pct = proc.get('memory_percent') or 0
+            
             table.add_row(
                 str(proc.get('pid', '')),
-                proc.get('name', 'N/A')[:28],
-                f"{proc.get('cpu_percent', 0):.1f}",
-                f"{proc.get('memory_percent', 0):.1f}"
+                proc.get('name', 'N/A')[:23],
+                f"{cpu_pct:.1f}",
+                f"{mem_pct:.1f}",
+                proc.get('status', 'N/A')[:8]
             )
         
         if not procs:
-            table.add_row("—", "No process data available", "—", "—")
+            table.add_row("—", "No data available", "—", "—", "—")
         
-        return Panel(table, title="[bold]⚙️  Top Processes[/bold]", box=box.ROUNDED)
+        return Panel(
+            table,
+            title="[bold cyan]⚙️  Top Processes[/bold cyan]",
+            box=box.ROUNDED,
+            border_style="cyan"
+        )
     
     def _get_content_panel(self) -> Panel:
         """Get content based on selected tab"""
-        tab_name = self.tabs[self.selected_tab]
+        _, tab_name = self.tabs[self.selected_tab]
         
         if tab_name == "Overview":
             return self._make_overview_panel()
@@ -678,46 +944,61 @@ class TermuxMonitor:
         return Panel("Content not available", box=box.ROUNDED)
     
     def _create_layout(self) -> Layout:
-        """Create the main layout"""
+        """Create layout with fixed dimensions"""
         layout = Layout()
         
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="body"),
+            Layout(name="body", size=self.ui_height),
         )
         
         layout["body"].split_row(
-            Layout(name="content", ratio=3),
-            Layout(name="sidebar", ratio=1, minimum_size=25),
+            Layout(name="sidebar", size=self.sidebar_width),
+            Layout(name="content"),
         )
         
-        # Update panels
-        layout["header"].update(self._make_header_panel())
+        layout["header"].update(self._make_header())
+        layout["sidebar"].update(self._make_sidebar())
         layout["content"].update(self._get_content_panel())
-        layout["sidebar"].update(self._make_tabs_panel())
         
         return layout
     
     def _handle_input(self):
-        """Handle keyboard input in a non-blocking way"""
+        """Handle keyboard input"""
         import termios
         import tty
+        import select
         
         old_settings = termios.tcgetattr(sys.stdin)
         try:
             tty.setcbreak(sys.stdin.fileno())
             
-            # Check if input is available
-            import select
             if select.select([sys.stdin], [], [], 0)[0]:
                 char = sys.stdin.read(1)
                 
                 if char == '\x1b':  # ESC sequence
                     char += sys.stdin.read(2)
-                    if char == '\x1b[A':  # Up arrow
-                        self.selected_tab = (self.selected_tab - 1) % len(self.tabs)
-                    elif char == '\x1b[B':  # Down arrow
-                        self.selected_tab = (self.selected_tab + 1) % len(self.tabs)
+                    
+                    if self.file_explorer.focused:
+                        if char == '\x1b[A':  # Up
+                            self.file_explorer.navigate_up()
+                        elif char == '\x1b[B':  # Down
+                            self.file_explorer.navigate_down()
+                        elif char == '\x1b':  # ESC alone
+                            self.file_explorer.focused = False
+                    else:
+                        if char == '\x1b[A':  # Up
+                            self.selected_tab = (self.selected_tab - 1) % len(self.tabs)
+                        elif char == '\x1b[B':  # Down
+                            self.selected_tab = (self.selected_tab + 1) % len(self.tabs)
+                
+                elif char == '\r' or char == '\n':  # Enter
+                    if self.tabs[self.selected_tab][1] == "Storage":
+                        if self.file_explorer.focused:
+                            self.file_explorer.enter_item()
+                        else:
+                            self.file_explorer.focused = True
+                
                 elif char.lower() == 'q':
                     self.running = False
                     
@@ -727,7 +1008,12 @@ class TermuxMonitor:
     def run(self):
         """Main run loop"""
         try:
-            with Live(self._create_layout(), console=self.console, refresh_per_second=4, screen=True) as live:
+            with Live(
+                self._create_layout(),
+                console=self.console,
+                refresh_per_second=4,
+                screen=False  # Don't use alternate screen to keep fixed height
+            ) as live:
                 while self.running:
                     self._handle_input()
                     live.update(self._create_layout())
@@ -736,8 +1022,7 @@ class TermuxMonitor:
             pass
         finally:
             self.running = False
-            self.console.clear()
-            self.console.print("[green]✨ Termux Monitor closed. Have a great day![/green]")
+            self.console.print("\n[green]✨ Monitor closed![/green]")
 
 
 def main():
