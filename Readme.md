@@ -31,7 +31,7 @@ pip install rich psutil
 ### Download
 
 ```bash
-curl -O https://raw.githubusercontent.com/yourusername/termux-status/main/status.py
+curl -O https://raw.githubusercontent.com/AhmarZaidi/termux-status/main/status.py
 chmod +x status.py
 ```
 
@@ -108,4 +108,4 @@ MIT License - feel free to use and modify!
 
 ## Contributing
 
-Issues and pull requests welcome at [your-repo-url]
+Issues and pull requests welcome [here](https://github.com/AhmarZaidi/termux-status/issues)
